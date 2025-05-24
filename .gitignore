@@ -1,0 +1,8 @@
+# rust
+**/target/
+**/*.rs.bk
+.DS_Store
+.vscode
+**/Cargo.lock
+*.code-workspace
+.cargo/

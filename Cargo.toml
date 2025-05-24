@@ -1,0 +1,25 @@
+[package]
+name = "distributed_mls"
+description = "MLS agent employing the Distributed MLS concept."
+categories = ["cryptography"]
+keywords = ["mls", "rfc9420", "e2ee"]
+version = "0.0.0"
+edition = "2021"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/josephlukefahr/distributed_mls"
+
+[dependencies]
+
+[dev-dependencies]
+
+[lints.rust]
+future_incompatible = "warn"
+let_underscore = "warn"
+missing_docs = "warn"
+rust_2021_compatibility = "warn"
+unused = "warn"
+unused_crate_dependencies = "warn"
+
+[lints.clippy]
+cargo = "warn"

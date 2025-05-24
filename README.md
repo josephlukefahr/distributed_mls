@@ -1,1 +1,1 @@
-# distributed_mls
+MLS agent employing the Distributed MLS concept.
