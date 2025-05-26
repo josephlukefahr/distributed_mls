@@ -10,6 +10,8 @@ readme = "README.md"
 repository = "https://github.com/josephlukefahr/distributed_mls"
 
 [dependencies]
+mls-rs = { git = "https://github.com/josephlukefahr/mls-rs", rev = "2a9cfa1" }
+mls-rs-crypto-openssl = { git = "https://github.com/josephlukefahr/mls-rs", rev = "2a9cfa1" }
 
 [dev-dependencies]
 
