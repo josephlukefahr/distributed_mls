@@ -42,6 +42,7 @@ fn handle_event(
     bytes_sent: &mut usize,
     bytes_received: &mut usize,
     event_counter: &mut usize,
+    process_counter: &mut usize,
 ) {
     match event {
         Event::Update(i) => {
@@ -50,7 +51,7 @@ fn handle_event(
             // broadcast commit
             events.push(Event::Broadcast(i, commit));
             // log
-            println!("{event_counter}:Update({i}):{messages_sent}:{messages_received}:{bytes_sent}:{bytes_received}");
+            println!("{event_counter}:Update({i}):{messages_sent}:{messages_received}:{bytes_sent}:{bytes_received}:{process_counter}");
         }
         Event::Initialize(i) => {
             // initialize group; pull key packages as necessary
@@ -66,7 +67,7 @@ fn handle_event(
                 events.push(Event::Broadcast(i, welcome));
             }
             // log
-            println!("{event_counter}:Initialize({i}):{messages_sent}:{messages_received}:{bytes_sent}:{bytes_received}");
+            println!("{event_counter}:Initialize({i}):{messages_sent}:{messages_received}:{bytes_sent}:{bytes_received}:{process_counter}");
         }
         Event::Broadcast(i, message) => {
             // broadcast message to all participants
@@ -78,7 +79,7 @@ fn handle_event(
             // log
             *messages_sent += 1;
             *bytes_sent += message.mls_encoded_len();
-            println!("{event_counter}:Broadcast({i},{:x}):{messages_sent}:{messages_received}:{bytes_sent}:{bytes_received}", md5::compute(&message.to_bytes().unwrap()));
+            println!("{event_counter}:Broadcast({i},{:x}):{messages_sent}:{messages_received}:{bytes_sent}:{bytes_received}:{process_counter}", md5::compute(&message.to_bytes().unwrap()));
         }
         Event::Deliver(i, message, j) => {
             // enqueue message for participant j
@@ -87,7 +88,7 @@ fn handle_event(
             // log
             *messages_received += 1;
             *bytes_received += message.mls_encoded_len();
-            println!("{event_counter}:Deliver({i},{:x},{j}):{messages_sent}:{messages_received}:{bytes_sent}:{bytes_received}", md5::compute(&message.to_bytes().unwrap()));
+            println!("{event_counter}:Deliver({i},{:x},{j}):{messages_sent}:{messages_received}:{bytes_sent}:{bytes_received}:{process_counter}", md5::compute(&message.to_bytes().unwrap()));
         }
         Event::Process(message_in, j) => {
             // process message for participant j
@@ -104,7 +105,8 @@ fn handle_event(
                 Err(e) => panic!("{e:?}"),
             }
             // log
-            println!("{event_counter}:Process({:x},{j}):{messages_sent}:{messages_received}:{bytes_sent}:{bytes_received}", md5::compute(&message_in.to_bytes().unwrap()));
+            *process_counter += 1;
+            println!("{event_counter}:Process({:x},{j}):{messages_sent}:{messages_received}:{bytes_sent}:{bytes_received}:{process_counter}", md5::compute(&message_in.to_bytes().unwrap()));
         }
     }
     *event_counter += 1;
@@ -126,6 +128,7 @@ fn main() {
     let mut bytes_sent = 0;
     let mut bytes_received = 0;
     let mut event_counter = 0;
+    let mut process_counter = 0;
     // create participants & seed initialization events
     for i in 0..args.num_participants {
         agents.push(DistributedMlsAgent::new(i.to_be_bytes().to_vec()).unwrap());
@@ -144,6 +147,7 @@ fn main() {
             &mut bytes_sent,
             &mut bytes_received,
             &mut event_counter,
+            &mut process_counter,
         );
     }
     // seed update events
@@ -162,6 +166,7 @@ fn main() {
             &mut bytes_sent,
             &mut bytes_received,
             &mut event_counter,
+            &mut process_counter,
         );
     }
 }
