@@ -6,11 +6,57 @@ crates to provide a structured API for managing MLS groups in distributed system
 
 ## Features
 
+- **Message Queuing**: Prioritized, epoch-ordered message queue for MLS messages.
 - **Send/Receive Group Model**: Each agent manages its own send-group and joins others' receive-groups.
 - **Secure Message Exchange**: Encrypt and decrypt MLS application messages.
 - **Post-Compromise Security (PCS)**: Heal groups using exporter-derived pre-shared keys (PSKs).
 - **Stateful Protocol Management**: Tracks lifecycle through `Uninitialized`, `Initializing`, and `Initialized` states.
 - **Robust Error Handling**: Rich error types for precise diagnostics.
+
+## Message Queuing: `MlsMessageQueue`
+
+The `MlsMessageQueue` is a specialized queue for handling MLS messages with correct prioritization and ordering. It is designed to ensure that control messages (such as Welcome or GroupInfo) are processed before application-layer messages, and that application messages are processed in epoch order.
+
+### How It Works
+
+- **Two Internal Queues**:
+  - `queue1`: FIFO queue for control messages (e.g., Welcome, GroupInfo).
+  - `queue2`: Priority queue for application and commit messages, ordered by epoch.
+
+- **Enqueueing**:
+  - Messages with `WireFormat::PublicMessage` or `WireFormat::PrivateMessage` are inserted into `queue2` in ascending order of epoch.
+  - All other messages are appended to `queue1` in FIFO order.
+
+- **Dequeuing**:
+  - Control messages in `queue1` are always dequeued first.
+  - If `queue1` is empty, the next message from `queue2` (lowest epoch) is dequeued.
+
+## DistributedMlsAgent
+
+The `DistributedMlsAgent` is the main abstraction for managing secure group communication in a distributed setting. Each agent manages its own **send-group** (which it creates and controls) and joins other participants' **receive-groups** (by processing welcome messages from peers). This enables a mesh of secure channels between all participants.
+
+### Lifecycle
+
+- **Uninitialized**: The agent is created but has not yet initialized its own send-group.
+- **Initializing**: The agent has created its send-group and is waiting to join other participants' send-groups.
+- **Initialized**: The agent has joined all expected receive-groups and is fully operational.
+
+### Key Operations
+
+- **Key Package Generation**:  
+  Each agent generates a key package that it shares with peers so they can add it to their groups.
+
+- **Group Initialization**:  
+  The agent creates its own send-group and initializes it with the key packages of all participants (including itself). This produces welcome messages for peers.
+
+- **Processing Messages**:  
+  The agent processes incoming messages (welcome, application, commit, etc.) using the `process` method. This updates group state and delivers plaintext messages as appropriate.
+
+- **Encrypting Messages**:  
+  The agent can encrypt application messages for the group using the `encrypt` method.
+
+- **Post-Compromise Security (PCS)**:  
+  The agent can periodically update its group using exporter-derived pre-shared keys to heal from compromise.
 
 ## Example
 
@@ -72,4 +118,4 @@ let (_, _charlie_ptxt_opt) = charlie.process(alice_message.clone()).unwrap();
 
 ## License
 
-Licensed under either the MIT or Apache-2.0 license.
+Licensed under either the MIT license.

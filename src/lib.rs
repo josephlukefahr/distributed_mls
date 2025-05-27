@@ -19,7 +19,78 @@ use mls_rs::{
     WireFormat,
 };
 use mls_rs_crypto_openssl::{OpensslCryptoError, OpensslCryptoProvider};
-use std::{cmp::Ordering, collections::HashMap};
+use std::{
+    cmp::Ordering,
+    collections::{HashMap, VecDeque},
+};
+
+/// A specialized message queue for prioritizing and ordering MLS messages.
+///
+/// `MlsMessageQueue` maintains two internal queues:
+///
+/// - `queue1`: A FIFO queue for control messages (e.g., Welcome, GroupInfo).
+/// - `queue2`: A priority queue for application and commit messages, ordered by epoch.
+///
+/// This structure ensures that control messages are processed before application-layer
+/// messages, and that application messages are processed in epoch order.
+pub struct MlsMessageQueue {
+    queue1: VecDeque<MlsMessage>,
+    queue2: VecDeque<MlsMessage>,
+}
+
+impl Default for MlsMessageQueue {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MlsMessageQueue {
+    /// Creates a new `MlsMessageQueue` instance with empty queues.
+    pub fn new() -> Self {
+        Self {
+            queue1: VecDeque::new(),
+            queue2: VecDeque::new(),
+        }
+    }
+    /// Dequeues the next `MlsMessage` from the queue.
+    ///
+    /// This method prioritizes control messages in `queue1`. If `queue1` is empty,
+    /// it returns the next message from `queue2` (which is ordered by epoch).
+    ///
+    /// # Returns
+    ///
+    /// An `Option<MlsMessage>` containing the next message to process, or `None`
+    /// if both queues are empty.
+    pub fn dequeue(&mut self) -> Option<MlsMessage> {
+        match self.queue1.pop_front() {
+            Some(message) => Some(message),
+            None => self.queue2.pop_front(),
+        }
+    }
+    /// Enqueues an `MlsMessage` into the appropriate internal queue.
+    ///
+    /// - Messages with `WireFormat::PublicMessage` or `WireFormat::PrivateMessage`
+    ///   are inserted into `queue2` in ascending order of epoch.
+    /// - All other messages are appended to `queue1` in FIFO order.
+    ///
+    /// # Arguments
+    ///
+    /// * `message` - The `MlsMessage` to enqueue.
+    pub fn enqueue(&mut self, message: MlsMessage) {
+        match message.wire_format() {
+            WireFormat::PublicMessage | WireFormat::PrivateMessage => {
+                let mut i = 0;
+                while i < self.queue2.len() && self.queue2[i].epoch() <= message.epoch() {
+                    i += 1;
+                }
+                self.queue2.insert(i, message);
+            }
+            _ => {
+                self.queue1.push_back(message);
+            }
+        }
+    }
+}
 
 /// Represents errors that can occur during the operation of a `DistributedMlsAgent`.
 ///

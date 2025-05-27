@@ -1,7 +1,9 @@
 //! Basic example of DMLS usage.
 
+use clap as _;
 use mls_rs as _;
 use mls_rs_crypto_openssl as _;
+use rand_chacha as _;
 
 use distributed_mls::{DistributedMlsAgent, DistributedMlsError};
 
