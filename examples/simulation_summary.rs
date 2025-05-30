@@ -67,6 +67,7 @@ fn handle_event(
             for welcome in welcomes {
                 events.push(Event::Broadcast(i, welcome));
             }
+            events.push(Event::Update(i));
             // log
             // println!("{event_counter}:Initialize({i}):{messages_sent}:{messages_received}:{bytes_sent}:{bytes_received}:{process_counter}");
         }
@@ -101,7 +102,9 @@ fn handle_event(
                     }
                 }
                 Err(DistributedMlsError::MessageDeferred(message_out)) => {
-                    events.push(Event::Process(message_out, j));
+                    // enqueue message to be re-processed
+                    queues[j as usize].enqueue(message_out.clone());
+                    events.push(Event::Process(queues[j as usize].dequeue().unwrap(), j));
                 }
                 Err(e) => panic!("{e:?}"),
             }
@@ -137,27 +140,6 @@ fn main() {
         events.push(Event::Initialize(i));
     }
     // loop for initialization
-    while !events.is_empty() {
-        handle_event(
-            events.remove(rng.next_u64() as usize % events.len()),
-            &mut agents,
-            &mut queues,
-            &mut events,
-            &mut messages_sent,
-            &mut messages_received,
-            &mut bytes_sent,
-            &mut bytes_received,
-            &mut event_counter,
-            &mut process_counter,
-        );
-    }
-    // log
-    println!("{}:{}:Initialized:{messages_sent}:{messages_received}:{bytes_sent}:{bytes_received}:{event_counter}:{process_counter}", args.num_participants, args.seed);
-    // seed update events
-    for i in 0..args.num_participants {
-        events.push(Event::Update(i));
-    }
-    // loop for updates
     while !events.is_empty() {
         handle_event(
             events.remove(rng.next_u64() as usize % events.len()),
