@@ -8,7 +8,7 @@
 use mls_rs::{
     client_builder::{BaseConfig, WithCryptoProvider, WithIdentityProvider},
     error::MlsError,
-    group::{CommitEffect, ReceivedMessage},
+    group::{CommitEffect, ContentType, ReceivedMessage},
     identity::{
         basic::{BasicCredential, BasicIdentityProvider},
         SigningIdentity,
@@ -16,7 +16,7 @@ use mls_rs::{
     mls_rules::{CommitOptions, DefaultMlsRules},
     psk::{ExternalPskId, PreSharedKey},
     CipherSuite, CipherSuiteProvider, Client, CryptoProvider, ExtensionList, Group, MlsMessage,
-    WireFormat,
+    MlsMessageDescription, WireFormat,
 };
 use mls_rs_crypto_openssl::{OpensslCryptoError, OpensslCryptoProvider};
 use std::{
@@ -79,11 +79,49 @@ impl MlsMessageQueue {
     pub fn enqueue(&mut self, message: MlsMessage) {
         match message.wire_format() {
             WireFormat::PublicMessage | WireFormat::PrivateMessage => {
-                let mut i = 0;
-                while i < self.queue2.len() && self.queue2[i].epoch() <= message.epoch() {
-                    i += 1;
+                // get message description
+                if let MlsMessageDescription::ProtocolMessage {
+                    group_id: _,
+                    epoch_id: message_epoch,
+                    content_type: message_type,
+                } = message.description()
+                {
+                    let queue_len = self.queue2.len();
+                    if queue_len == 0 {
+                        // if we have an empty queue2, we can just push the message
+                        self.queue2.push_back(message);
+                    } else {
+                        // find insertion point in queue2, starting after the last message in the same epoch
+                        let mut i = 0;
+                        while i < self.queue2.len()
+                            && self.queue2[i].epoch().unwrap() <= message_epoch
+                        {
+                            i += 1;
+                        }
+                        // if we're still at the beginning, we can just push the message
+                        if i == 0 {
+                            self.queue2.insert(i, message);
+                        } else {
+                            // now get description of the last message in the epoch and figure out where to insert the new message
+                            if let MlsMessageDescription::ProtocolMessage {
+                                group_id: _,
+                                epoch_id: _,
+                                content_type: last_type,
+                            } = self.queue2[i - 1].description()
+                            {
+                                if message_type == ContentType::Application
+                                    && last_type == ContentType::Commit
+                                {
+                                    // if we received an application message and the last message in the epoch is a commit, we need to insert before it
+                                    self.queue2.insert(i - 1, message);
+                                } else {
+                                    // otherwise, we can insert after it
+                                    self.queue2.insert(i, message);
+                                }
+                            }
+                        }
+                    }
                 }
-                self.queue2.insert(i, message);
             }
             _ => {
                 self.queue1.push_back(message);
@@ -145,6 +183,8 @@ pub enum DistributedMlsError {
     MlsMessageTooOld,
     /// Message sender unauthorized, i.e., attempted to send a message in another participant's send-group.
     UnauthorizedSender,
+    /// Message queue empty
+    MessageQueueEmpty,
     /// Message cannot be processed yet; may be processed later.
     MessageDeferred(MlsMessage),
     /// Error from underlying OpenSSL library.
@@ -159,33 +199,13 @@ impl core::fmt::Display for DistributedMlsError {
     }
 }
 
-/// Represents the current lifecycle state of a `DistributedMlsAgent`.
-///
-/// This enum is used internally to track the agent's progress through the
-/// Distributed MLS protocol. It ensures that operations such as encryption,
-/// message processing, and group updates are only performed when the agent
-/// is in a valid state.
-///
-/// # Variants
-///
-/// - `Uninitialized`:  
-///   The agent has been created but has not yet initialized its own send-group.
-///
-/// - `Initializing`:  
-///   The agent has created its send-group and is waiting to join other participants'
-///   send-groups via welcome messages.
-///
-/// - `Initialized`:  
-///   The agent has successfully joined all expected receive-groups and is fully
-///   operational for secure group communication.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DistributedMlsState {
-    /// DMLS group has not yet been established.
-    Uninitialized,
-    /// Own send-group created but waiting for welcome messages to join other participants' send-groups.
-    Initializing,
-    /// All groups created.
-    Initialized,
+#[derive(Debug)]
+pub enum ProcessOutcome {
+    PayloadDecrypted(Vec<u8>, u64, Vec<u8>, Vec<u8>),
+    UpdateApplied(Vec<u8>, u64, MlsMessage),
+    OtherCommitApplied(Vec<u8>, u64),
+    GroupJoined(Vec<u8>, u64),
+    Nothing,
 }
 
 type DistributedMlsConfig = WithIdentityProvider<
@@ -225,15 +245,15 @@ type DistributedMlsConfig = WithIdentityProvider<
 /// where each participant manages their own MLS group and joins others' groups
 /// to form a mesh of secure communication channels.
 pub struct DistributedMlsAgent {
-    state: DistributedMlsState,
+    queue: MlsMessageQueue,
     client: Client<DistributedMlsConfig>,
-    send_group: Option<Group<DistributedMlsConfig>>,
+    send_group: Group<DistributedMlsConfig>,
     recv_groups: HashMap<Vec<u8>, Group<DistributedMlsConfig>>,
-    num_recv_groups: usize,
+    exporter_length: usize,
 }
 
 impl DistributedMlsAgent {
-    /// Creates a new `DistributedMlsAgent` instance with the given identity name.
+    /// Creates a new `DistributedMlsAgent` instance with the given identifier.
     ///
     /// This function initializes the MLS client with a predefined cipher suite
     /// (`CURVE25519_AES128`) and sets up the cryptographic and identity providers.
@@ -242,13 +262,13 @@ impl DistributedMlsAgent {
     ///
     /// # Arguments
     ///
-    /// * `name` - A byte vector representing the identity name of the agent.
+    /// * `name` - A byte vector representing the identifier of the agent.
     ///
     /// # Returns
     ///
     /// A `Result` containing the initialized `DistributedMlsAgent` on success,
     /// or a `DistributedMlsError` if the cipher suite is unavailable or key generation fails.
-    pub fn new(name: Vec<u8>) -> Result<Self, DistributedMlsError> {
+    pub fn new(name: Vec<u8>, exporter_length: usize) -> Result<Self, DistributedMlsError> {
         // cipher suite choice
         let cipher_suite_choice = CipherSuite::CURVE25519_AES128;
         // openssl crypto provider
@@ -275,13 +295,17 @@ impl DistributedMlsAgent {
                 cipher_suite_choice,
             )
             .build();
+        // send group
+        let send_group = client
+            .create_group(ExtensionList::default(), Default::default(), None)
+            .map_err(DistributedMlsError::MlsError)?;
         // done; the rest of the variables are given initial values
         Ok(Self {
             client,
-            state: DistributedMlsState::Uninitialized,
-            send_group: None,
+            send_group,
             recv_groups: HashMap::new(),
-            num_recv_groups: 0,
+            queue: MlsMessageQueue::new(),
+            exporter_length,
         })
     }
     /// Generates a new MLS key package message for this agent.
@@ -296,54 +320,8 @@ impl DistributedMlsAgent {
     /// or a `DistributedMlsError` if generation fails.
     pub fn generate_key_package_message(&self) -> Result<MlsMessage, DistributedMlsError> {
         self.client
-            .generate_key_package_message(ExtensionList::default(), ExtensionList::default())
+            .generate_key_package_message(ExtensionList::default(), ExtensionList::default(), None)
             .map_err(DistributedMlsError::MlsError)
-    }
-    /// Initializes the agent's own send-group using key packages from other participants.
-    ///
-    /// This method creates a new MLS group and adds the provided participants
-    /// to it. It transitions the agent's state to `Initializing` and prepares
-    /// to receive welcome messages from other participants' send-groups.
-    ///
-    /// # Arguments
-    ///
-    /// * `key_package_messages` - A vector of `MlsMessage` objects representing
-    ///   key packages from other participants.
-    ///
-    /// # Returns
-    ///
-    /// A `Result` containing a vector of welcome messages to be sent to the added
-    /// participants, or a `DistributedMlsError` if group creation or commit fails.
-    pub fn initialize(
-        &mut self,
-        key_package_messages: Vec<MlsMessage>,
-    ) -> Result<Vec<MlsMessage>, DistributedMlsError> {
-        // create send-group
-        let mut send_group = self
-            .client
-            .create_group(ExtensionList::default(), Default::default())
-            .map_err(DistributedMlsError::MlsError)?;
-        // store number of recv-groups to expect
-        let num_recv_groups = key_package_messages.len();
-        // add participants to send-group
-        let mut commit_builder = send_group.commit_builder();
-        for key_package_message in key_package_messages {
-            commit_builder = commit_builder
-                .add_member(key_package_message)
-                .map_err(DistributedMlsError::MlsError)?;
-        }
-        let commit = &commit_builder
-            .build()
-            .map_err(DistributedMlsError::MlsError)?;
-        send_group
-            .apply_pending_commit()
-            .map_err(DistributedMlsError::MlsError)?;
-        // update dmls state
-        self.num_recv_groups = num_recv_groups;
-        self.send_group = Some(send_group);
-        self.state = DistributedMlsState::Initializing;
-        // output welcome(s)
-        Ok(commit.welcome_messages.clone())
     }
     /// Performs a self-update and initiates PCS (Post-Compromise Security) healing.
     ///
@@ -356,46 +334,53 @@ impl DistributedMlsAgent {
     /// A `Result` containing the `MlsMessage` representing the commit message,
     /// or a `DistributedMlsError` if the group is uninitialized or the update fails.
     pub fn update(&mut self) -> Result<MlsMessage, DistributedMlsError> {
-        match self.state {
-            DistributedMlsState::Uninitialized => Err(DistributedMlsError::GroupNotInitialized),
-            _ => {
-                let send_group = self.send_group.as_mut().unwrap();
-                // commit update
-                let commit_message = send_group
-                    .commit_builder()
-                    .build()
-                    .map_err(DistributedMlsError::MlsError)?
-                    .commit_message;
-                send_group
-                    .apply_pending_commit()
-                    .map_err(DistributedMlsError::MlsError)?;
-                // generate psk_id as context for exporter
-                let mut psk_id_vec = Vec::from(send_group.current_epoch().to_be_bytes());
-                psk_id_vec.extend(send_group.group_id().to_vec());
-                // hash function length as exporter length
-                let hash_length = match send_group.cipher_suite() {
-                    CipherSuite::CURVE25519_AES128
-                    | CipherSuite::P256_AES128
-                    | CipherSuite::CURVE25519_CHACHA => Ok(32),
-                    CipherSuite::CURVE448_AES256
-                    | CipherSuite::P521_AES256
-                    | CipherSuite::CURVE448_CHACHA
-                    | CipherSuite::P384_AES256 => Ok(64),
-                    _ => Err(DistributedMlsError::UnsupportedCipherSuite),
-                }?;
-                // export secret
-                let exporter = send_group
-                    .export_secret(b"exporter_psk", psk_id_vec.as_slice(), hash_length)
-                    .map_err(DistributedMlsError::MlsError)?;
-                // store as psk
-                self.client.secret_store().insert(
-                    ExternalPskId::new(psk_id_vec),
-                    PreSharedKey::new(exporter.to_vec()),
-                );
-                // done
-                Ok(commit_message)
-            }
-        }
+        // commit update ni send group immediately
+        let commit_message = self
+            .send_group
+            .commit_builder()
+            .build()
+            .map_err(DistributedMlsError::MlsError)?
+            .commit_message;
+        self.send_group
+            .apply_pending_commit()
+            .map_err(DistributedMlsError::MlsError)?;
+        // generate psk_id as context for exporter
+        let mut psk_id_vec = Vec::from(self.send_group.current_epoch().to_be_bytes());
+        psk_id_vec.extend(self.send_group.group_id().to_vec());
+        // export secret
+        let exporter = self
+            .send_group
+            .export_secret(b"exporter_psk", psk_id_vec.as_slice(), self.exporter_length)
+            .map_err(DistributedMlsError::MlsError)?;
+        // store as psk
+        self.client.secret_store().insert(
+            ExternalPskId::new(psk_id_vec),
+            PreSharedKey::new(exporter.to_vec()),
+        );
+        // done
+        Ok(commit_message)
+    }
+    /// Adds a new participant to the agent's send-group.
+    ///
+    /// This method processes a key package message from another participant,
+    /// committing it to the send-group and generating a welcome message for that participant.
+    pub fn add(
+        &mut self,
+        key_package_message: MlsMessage,
+    ) -> Result<(MlsMessage, MlsMessage), DistributedMlsError> {
+        // add participants to send-group
+        let mut commit = self
+            .send_group
+            .commit_builder()
+            .add_member(key_package_message)
+            .map_err(DistributedMlsError::MlsError)?
+            .build()
+            .map_err(DistributedMlsError::MlsError)?;
+        self.send_group
+            .apply_pending_commit()
+            .map_err(DistributedMlsError::MlsError)?;
+        // output welcome(s)
+        Ok((commit.commit_message, commit.welcome_messages.remove(0)))
     }
     /// Encrypts an application message using the agent's send-group.
     ///
@@ -405,192 +390,181 @@ impl DistributedMlsAgent {
     /// # Arguments
     ///
     /// * `ptxt` - A byte slice representing the plaintext to encrypt.
+    /// * `ad` - A byte slice representing additional authenticated data (AAD) to be sent
     ///
     /// # Returns
     ///
     /// A `Result` containing the encrypted `MlsMessage`, or a `DistributedMlsError`
     /// if the group is uninitialized or encryption fails.
-    pub fn encrypt(&mut self, ptxt: &[u8]) -> Result<MlsMessage, DistributedMlsError> {
-        match self.state {
-            DistributedMlsState::Uninitialized => Err(DistributedMlsError::GroupNotInitialized),
-            _ => self
-                .send_group
-                .as_mut()
-                .unwrap()
-                .encrypt_application_message(ptxt, Vec::new())
-                .map_err(DistributedMlsError::MlsError),
-        }
+    pub fn encrypt(
+        &mut self,
+        ptxt: Vec<u8>,
+        ad: Vec<u8>,
+    ) -> Result<MlsMessage, DistributedMlsError> {
+        self.send_group
+            .encrypt_application_message(ptxt.as_slice(), ad)
+            .map_err(DistributedMlsError::MlsError)
+    }
+    /// Enqueues an incoming MLS message for future processing.
+    ///
+    /// This method is used to initially handle messages received from other participants.
+    /// It adds the message to the agent's internal queue for processing in the
+    /// correct order, ensuring that messages are processed according to ordering requirements for MLS.
+    pub fn enqueue(&mut self, message: MlsMessage) {
+        self.queue.enqueue(message);
     }
     /// Processes an incoming MLS message and updates internal state accordingly.
-    ///
-    /// This method handles different types of MLS messages based on the agent's
-    /// current state:
-    ///
-    /// - In `Uninitialized`, all messages are deferred.
-    /// - In `Initializing`, welcome messages are used to join other participants' send-groups.
-    /// - In `Initialized`, application and commit messages are processed from known groups.
-    ///
-    /// It also performs PCS healing by exporting and committing PSKs when appropriate.
-    ///
-    /// # Arguments
-    ///
-    /// * `message` - The incoming `MlsMessage` to process.
     ///
     /// # Returns
     ///
     /// A `Result` containing a tuple:
-    /// - A vector of `MlsMessage` objects to be sent in response (e.g., commit messages).
+    /// - An optional`MlsMessage` to be sent in response (e.g., commit message).
     /// - An optional decrypted application message payload, if applicable.
     ///
     /// Returns a `DistributedMlsError` if the message is invalid, from an unknown group,
     /// unauthorized, outdated, or cannot yet be processed.
-    pub fn process(
-        &mut self,
-        message: MlsMessage,
-    ) -> Result<(Vec<MlsMessage>, Option<Vec<u8>>), DistributedMlsError> {
-        match self.state {
-            DistributedMlsState::Uninitialized => {
-                Err(DistributedMlsError::MessageDeferred(message))
-            }
-            DistributedMlsState::Initializing => match message.wire_format() {
-                WireFormat::Welcome => {
-                    // try to join group
-                    let (new_group, _info) = self
-                        .client
-                        .join_group(None, &message)
-                        .map_err(DistributedMlsError::MlsError)?;
-                    if self
-                        .send_group
-                        .as_ref()
-                        .unwrap()
-                        .roster()
-                        .member_identities_iter()
-                        .any(|x| *x == new_group.member_at_index(0).unwrap().signing_identity)
-                        && self.recv_groups.len() < self.num_recv_groups
-                    {
-                        // update state; i.e., add to recv-groups and transition to Initialized if this is the last recv-group
-                        self.recv_groups
-                            .insert(new_group.group_id().to_vec(), new_group);
-                        if self.recv_groups.len() == self.num_recv_groups {
-                            self.state = DistributedMlsState::Initialized;
-                        }
+    pub fn process(&mut self) -> Result<ProcessOutcome, DistributedMlsError> {
+        match self.queue.dequeue() {
+            Some(message) => {
+                match message.wire_format() {
+                    WireFormat::Welcome => {
+                        // try to join group
+                        let (new_group, _info) = self
+                            .client
+                            .join_group(None, &message, None)
+                            .map_err(DistributedMlsError::MlsError)?;
+                        let new_group_id = new_group.group_id().to_vec();
+                        let new_group_epoch = new_group.current_epoch();
+                        // add to recv-groups
+                        self.recv_groups.insert(new_group_id.clone(), new_group);
                         // done
-                        Ok((Vec::new(), None))
-                    } else {
-                        Err(DistributedMlsError::ExtraneousMlsGroup)
+                        Ok(ProcessOutcome::GroupJoined(new_group_id, new_group_epoch))
                     }
-                }
-                WireFormat::PublicMessage | WireFormat::PrivateMessage => {
-                    Err(DistributedMlsError::MessageDeferred(message))
-                }
-                _ => Err(DistributedMlsError::ExtraneousMlsMessage),
-            },
-            DistributedMlsState::Initialized => match message.wire_format() {
-                WireFormat::PublicMessage | WireFormat::PrivateMessage => match self
-                    .recv_groups
-                    .get_mut(message.group_id().unwrap())
-                {
-                    Some(recv_group) => {
-                        match message.epoch().unwrap().cmp(&recv_group.current_epoch()) {
-                            Ordering::Equal => {
-                                let mut recv_group_clone = recv_group.clone();
-                                match recv_group_clone.process_incoming_message(message.clone()) {
-                                    Ok(received_message) => match received_message {
-                                        ReceivedMessage::ApplicationMessage(decrypted_appmsg) => {
-                                            if decrypted_appmsg.sender_index == 0 {
-                                                Ok((
-                                                    Vec::new(),
-                                                    Some(decrypted_appmsg.data().to_vec()),
-                                                ))
-                                            } else {
-                                                Err(DistributedMlsError::UnauthorizedSender)
-                                            }
-                                        }
-                                        ReceivedMessage::Commit(decrypted_commit) => {
-                                            if decrypted_commit.committer == 0 {
-                                                *recv_group = recv_group_clone;
-                                                if let CommitEffect::NewEpoch(new_epoch) =
-                                                    decrypted_commit.effect
-                                                {
-                                                    if new_epoch.applied_proposals.is_empty() {
-                                                        // generate psk_id as context for exporter
-                                                        let mut psk_id_vec = Vec::from(
-                                                            recv_group
-                                                                .current_epoch()
-                                                                .to_be_bytes(),
-                                                        );
-                                                        psk_id_vec
-                                                            .extend(recv_group.group_id().to_vec());
-                                                        // hash function length as exporter length
-                                                        let hash_length = match recv_group.cipher_suite() {
-                                                        CipherSuite::CURVE25519_AES128
-                                                        | CipherSuite::P256_AES128
-                                                        | CipherSuite::CURVE25519_CHACHA => Ok(32),
-                                                        CipherSuite::CURVE448_AES256
-                                                        | CipherSuite::P521_AES256
-                                                        | CipherSuite::CURVE448_CHACHA
-                                                        | CipherSuite::P384_AES256 => Ok(64),
-                                                        _ => Err(
-                                                            DistributedMlsError::UnsupportedCipherSuite,
-                                                        ),
-                                                    }?;
-                                                        // export secret
-                                                        let exporter = recv_group
-                                                            .export_secret(
-                                                                b"exporter_psk",
-                                                                psk_id_vec.as_slice(),
-                                                                hash_length,
-                                                            )
-                                                            .map_err(
-                                                                DistributedMlsError::MlsError,
-                                                            )?;
-                                                        // store as psk
-                                                        self.client.secret_store().insert(
-                                                            ExternalPskId::new(psk_id_vec.clone()),
-                                                            PreSharedKey::new(exporter.to_vec()),
-                                                        );
-                                                        // commit the psk in send-group
-                                                        let send_group =
-                                                            self.send_group.as_mut().unwrap();
-                                                        let commit_message = send_group
-                                                            .commit_builder()
-                                                            .add_external_psk(ExternalPskId::new(
-                                                                psk_id_vec.clone(),
-                                                            ))
-                                                            .map_err(DistributedMlsError::MlsError)?
-                                                            .build()
-                                                            .map_err(DistributedMlsError::MlsError)?
-                                                            .commit_message;
-                                                        send_group.apply_pending_commit().map_err(
-                                                            DistributedMlsError::MlsError,
-                                                        )?;
-                                                        Ok((vec![commit_message], None))
+                    WireFormat::PublicMessage | WireFormat::PrivateMessage => {
+                        match message.description() {
+                            MlsMessageDescription::ProtocolMessage {
+                                group_id: message_group_id,
+                                epoch_id: message_epoch,
+                                content_type: message_type,
+                            } => {
+                                match self.recv_groups.get_mut(message_group_id) {
+                                    Some(recv_group) => {
+                                        match message_epoch.cmp(&recv_group.current_epoch()) {
+                                            Ordering::Equal => match message_type {
+                                                ContentType::Application => {
+                                                    match recv_group
+                                                .process_incoming_message(message)
+                                                .map_err(DistributedMlsError::MlsError)?
+                                            {
+                                                ReceivedMessage::ApplicationMessage(
+                                                    decrypted_appmsg,
+                                                ) => {
+                                                    if decrypted_appmsg.sender_index == 0 {
+                                                        Ok(ProcessOutcome::PayloadDecrypted(
+                                                            recv_group.group_id().to_vec(),
+                                                            recv_group.current_epoch(),
+                                                            decrypted_appmsg.data().to_vec(),
+                                                            decrypted_appmsg
+                                                                .authenticated_data
+                                                                .clone(),
+                                                        ))
                                                     } else {
-                                                        Ok((Vec::new(), None))
+                                                        Err(DistributedMlsError::UnauthorizedSender)
                                                     }
-                                                } else {
-                                                    Ok((Vec::new(), None))
                                                 }
-                                            } else {
-                                                Err(DistributedMlsError::UnauthorizedSender)
+                                                _ => Err(DistributedMlsError::ExtraneousMlsMessage),
+                                            }
+                                                }
+                                                ContentType::Commit => {
+                                                    let mut recv_group_clone = recv_group.clone();
+                                                    match recv_group_clone
+                                                .process_incoming_message(message)
+                                                .map_err(DistributedMlsError::MlsError)?
+                                            {
+                                                ReceivedMessage::Commit(decrypted_commit) => {
+                                                    if decrypted_commit.committer == 0 {
+                                                        *recv_group = recv_group_clone;
+                                                        match decrypted_commit.effect {
+                                                            CommitEffect::NewEpoch(new_epoch) => {
+                                                                if new_epoch.applied_proposals.is_empty() {
+                                                                    // generate psk_id as context for exporter
+                                                                    let mut psk_id_vec = Vec::from(
+                                                                        recv_group
+                                                                            .current_epoch()
+                                                                            .to_be_bytes(),
+                                                                    );
+                                                                    psk_id_vec
+                                                                        .extend(recv_group.group_id().to_vec());
+                                                                    // export secret
+                                                                    let exporter = recv_group
+                                                                        .export_secret(
+                                                                            b"exporter_psk",
+                                                                            psk_id_vec.as_slice(),
+                                                                            self.exporter_length,
+                                                                        )
+                                                                        .map_err(
+                                                                            DistributedMlsError::MlsError,
+                                                                        )?;
+                                                                    // store as psk
+                                                                    self.client.secret_store().insert(
+                                                                        ExternalPskId::new(psk_id_vec.clone()),
+                                                                        PreSharedKey::new(exporter.to_vec()),
+                                                                    );
+                                                                    // commit the psk in send-group
+                                                                    let commit_message = self.send_group
+                                                                        .commit_builder()
+                                                                        .add_external_psk(ExternalPskId::new(
+                                                                            psk_id_vec.clone(),
+                                                                        ))
+                                                                        .map_err(DistributedMlsError::MlsError)?
+                                                                        .build()
+                                                                        .map_err(DistributedMlsError::MlsError)?
+                                                                        .commit_message;
+                                                                    self.send_group.apply_pending_commit().map_err(
+                                                                        DistributedMlsError::MlsError,
+                                                                    )?;
+                                                                    Ok(ProcessOutcome::UpdateApplied(
+                                                                        recv_group.group_id().to_vec(),
+                                                                        recv_group.current_epoch() - 1,
+                                                                        commit_message,
+                                                                    ))
+                                                                } else {
+                                                                    // no psk to commit, just return None
+                                                                    Ok(ProcessOutcome::OtherCommitApplied(
+                                                                        recv_group.group_id().to_vec(),
+                                                                        recv_group.current_epoch() - 1,
+                                                                    ))
+                                                                }
+                                                            }
+                                                            _ => Ok(ProcessOutcome::OtherCommitApplied(recv_group.group_id().to_vec(), recv_group.current_epoch() - 1)),
+                                                        }
+                                                    } else {
+                                                        Err(DistributedMlsError::UnauthorizedSender)
+                                                    }
+                                                }
+                                                _ => Err(DistributedMlsError::ExtraneousMlsMessage),
+                                            }
+                                                }
+                                                _ => Err(DistributedMlsError::ExtraneousMlsMessage),
+                                            },
+                                            Ordering::Less => {
+                                                Err(DistributedMlsError::MlsMessageTooOld)
+                                            }
+                                            Ordering::Greater => {
+                                                Err(DistributedMlsError::MessageDeferred(message))
                                             }
                                         }
-                                        _ => Err(DistributedMlsError::ExtraneousMlsMessage),
-                                    },
-                                    Err(MlsError::MissingRequiredPsk) => {
-                                        Err(DistributedMlsError::MessageDeferred(message))
                                     }
-                                    Err(e) => Err(DistributedMlsError::MlsError(e)),
+                                    None => Err(DistributedMlsError::MessageDeferred(message)),
                                 }
                             }
-                            Ordering::Less => Err(DistributedMlsError::MlsMessageTooOld),
-                            Ordering::Greater => Err(DistributedMlsError::MessageDeferred(message)),
+                            _ => Err(DistributedMlsError::ExtraneousMlsMessage),
                         }
                     }
                     _ => Err(DistributedMlsError::ExtraneousMlsMessage),
-                },
-                _ => Err(DistributedMlsError::ExtraneousMlsMessage),
-            },
+                }
+            }
+            None => Err(DistributedMlsError::MessageQueueEmpty),
         }
     }
 }

@@ -10,13 +10,14 @@ readme = "README.md"
 repository = "https://github.com/josephlukefahr/distributed_mls"
 
 [dependencies]
-mls-rs = { git = "https://github.com/josephlukefahr/mls-rs", rev = "2a9cfa1" }
-mls-rs-crypto-openssl = { git = "https://github.com/josephlukefahr/mls-rs", rev = "2a9cfa1" }
+mls-rs = "0.48"
+mls-rs-crypto-openssl = "0.16"
 
 [dev-dependencies]
 clap = { version = "4.4", features = ["derive"] }
+hex = "0.4"
 md5 = "0.7"
-mls-rs-codec = { git = "https://github.com/josephlukefahr/mls-rs", rev = "2a9cfa1" }
+mls-rs-codec = "0.6"
 rand_chacha = "0.9"
 
 [lints.rust]
