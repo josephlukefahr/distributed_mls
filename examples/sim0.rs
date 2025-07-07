@@ -18,7 +18,7 @@ use mls_rs_crypto_openssl as _;
 #[derive(Debug)]
 enum Event {
     Broadcast(u16, MlsMessage),
-    Enqueue(u16, MlsMessage),
+    Receive(u16, MlsMessage),
     Encrypt(u16, String, String),
     Process(u16),
     Add(u16, MlsMessage),
@@ -68,7 +68,7 @@ fn main() {
         }
     }
     // seed initialization events & run in phases
-    for phase in 0..2 {
+    for phase in 0..3 {
         println!("\n=== PHASE {phase} ===");
         // seed events by phase
         match phase {
@@ -104,6 +104,11 @@ fn main() {
                         format!("Hello, world, from participant {i}!"),
                         format!("Test AAD!"),
                     ));
+                }
+            }
+            2 => {
+                // phase 2: everyone updates and broadcasts a message
+                for i in 0..agents.len() as u16 {
                     println!("\nSEEDING EVENT: PARTICIPANT {i} UPDATES");
                     events.push(Event::Update(i));
                 }
@@ -125,7 +130,7 @@ fn main() {
                     // broadcast message to all participants
                     for j in 0..agents.len() as u16 {
                         if j != i {
-                            events.push(Event::Enqueue(j, message.clone()));
+                            events.push(Event::Receive(j, message.clone()));
                         }
                     }
                 }
@@ -162,12 +167,17 @@ fn main() {
                         }
                     }
                 }
-                Event::Enqueue(j, message) => {
+                Event::Receive(j, message) => {
                     // log
                     messages_received += 1;
                     bytes_received += message.mls_encoded_len();
                     // enqueue message for participant j
-                    agents.get_mut(j as usize).unwrap().enqueue(message);
+                    if let Some(dropped_message) =
+                        agents.get_mut(j as usize).unwrap().enqueue(message)
+                    {
+                        // if a message was dropped, log it
+                        println!("**DROPPED: {dropped_message:?}");
+                    }
                     // push event for processing
                     events.push(Event::Process(j));
                 }
@@ -183,11 +193,13 @@ fn main() {
                         );
                         }
                         // handle update
-                        ProcessOutcome::UpdateApplied(group_id, epoch, message) => {
+                        ProcessOutcome::UpdateApplied(group_id, epoch, commit) => {
                             println!(
-                            "APPLIED COMMIT (EMPTY UPDATE) in {}::{epoch}\nCOMMIT TO BROADCAST: {message:?}",
+                            "APPLIED COMMIT (EMPTY UPDATE) in {}::{epoch}\nCOMMIT TO BROADCAST: {commit:?}",
                             hex::encode(group_id)
                         );
+                            // broadcast exporter-psk inject commit
+                            events.push(Event::Broadcast(j, commit));
                         }
                         // handle other commit
                         ProcessOutcome::OtherCommitApplied(group_id, epoch) => {
@@ -202,12 +214,6 @@ fn main() {
                         }
                         _ => {}
                     },
-                    Err(DistributedMlsError::MessageDeferred(message)) => {
-                        // re-enqueue message for processing
-                        agents.get_mut(j as usize).unwrap().enqueue(message);
-                        events.push(Event::Process(j));
-                        println!("**DEFERRED");
-                    }
                     Err(e) => {
                         println!("**FAILED: {e}");
                     }
