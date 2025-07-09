@@ -34,9 +34,9 @@ use std::{
 /// This structure ensures that control messages are processed before application-layer
 /// messages, and that application messages are processed in epoch order.
 pub struct MlsMessageQueue {
-    queue1: VecDeque<MlsMessage>,
-    queue2: VecDeque<MlsMessage>,
-    queue3: VecDeque<MlsMessage>,
+    pub queue1: VecDeque<MlsMessage>,
+    pub queue2: VecDeque<MlsMessage>,
+    pub queue3: VecDeque<MlsMessage>,
 }
 
 impl Default for MlsMessageQueue {
@@ -301,11 +301,11 @@ type DistributedMlsConfig = WithIdentityProvider<
 /// where each participant manages their own MLS group and joins others' groups
 /// to form a mesh of secure communication channels.
 pub struct DistributedMlsAgent {
-    queue: MlsMessageQueue,
-    client: Client<DistributedMlsConfig>,
-    send_group: Group<DistributedMlsConfig>,
-    recv_groups: HashMap<Vec<u8>, Group<DistributedMlsConfig>>,
-    exporter_length: usize,
+    pub queue: MlsMessageQueue,
+    pub client: Client<DistributedMlsConfig>,
+    pub send_group: Group<DistributedMlsConfig>,
+    pub recv_groups: HashMap<Vec<u8>, Group<DistributedMlsConfig>>,
+    pub exporter_length: usize,
 }
 
 impl DistributedMlsAgent {
